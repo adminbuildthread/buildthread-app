@@ -1,20 +1,38 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Directory, File, Paths } from 'expo-file-system';
 
-import { decodeBase64, uploadJpeg } from '@/lib/upload-jpeg';
+import { commitEvidence, type EvidenceDraft } from '@/lib/commit-evidence';
+import type { EvidenceSource, EvidenceStage } from '@/lib/evidence-record';
+import { decodeBase64 } from '@/lib/upload-jpeg';
 
 const QUEUE_KEY = '@buildthread_offline_queue';
 
 export type QueuedPhoto = {
   id: string;
+  evidenceId: string;
   userId: string;
   projectId: string;
   locationId: string;
-  stage: 'before' | 'during' | 'after';
-  localUri: string;
-  capturedAt: string;
-  location: { latitude: number; longitude: number } | null;
-  note?: string;
+  stage: EvidenceStage;
+  originalUri: string;
+  stampedUri: string;
+  originalSha256: string;
+  originalPath: string;
+  stampedPath: string;
+  deviceCapturedAt: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  accuracy: number | null;
+  note: string;
+  source: EvidenceSource;
+  product: string;
+  batch: string;
+  itemCode: string;
+  jobReference: string;
+  operativeUid: string;
+  operativeName: string;
+  correctionOf: string | null;
+  syncError: string | null;
 };
 
 type QueueListener = (items: QueuedPhoto[]) => void;
@@ -24,22 +42,6 @@ const listeners = new Set<QueueListener>();
 const syncListeners = new Set<SyncListener>();
 let isSyncing = false;
 let lastSyncStarted = 0;
-
-function withTimeout<T>(promise: Promise<T>, milliseconds: number): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('Could not upload this photo.')), milliseconds);
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error: unknown) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}
 
 function notify(items: QueuedPhoto[]) {
   const snapshot = items.slice();
@@ -58,6 +60,22 @@ function offlineDirectory(): Directory {
   return directory;
 }
 
+function isQueuedPhoto(value: unknown): value is QueuedPhoto {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const record = value as Partial<QueuedPhoto>;
+  return (
+    typeof record.id === 'string' &&
+    typeof record.evidenceId === 'string' &&
+    typeof record.userId === 'string' &&
+    typeof record.projectId === 'string' &&
+    typeof record.originalUri === 'string' &&
+    typeof record.stampedUri === 'string' &&
+    typeof record.originalSha256 === 'string'
+  );
+}
+
 async function readQueue(): Promise<QueuedPhoto[]> {
   const raw = await AsyncStorage.getItem(QUEUE_KEY);
   if (!raw) {
@@ -65,7 +83,7 @@ async function readQueue(): Promise<QueuedPhoto[]> {
   }
   try {
     const parsed = JSON.parse(raw) as unknown;
-    return Array.isArray(parsed) ? (parsed as QueuedPhoto[]) : [];
+    return Array.isArray(parsed) ? parsed.filter(isQueuedPhoto) : [];
   } catch {
     return [];
   }
@@ -74,6 +92,16 @@ async function readQueue(): Promise<QueuedPhoto[]> {
 async function writeQueue(items: QueuedPhoto[]): Promise<void> {
   await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify(items));
   notify(items);
+}
+
+function copyIntoQueue(sourceUri: string, name: string): string {
+  const source = new File(sourceUri);
+  const destination = new File(offlineDirectory(), name);
+  if (destination.exists) {
+    destination.delete();
+  }
+  source.copy(destination);
+  return destination.uri;
 }
 
 export function subscribeOfflineQueue(listener: QueueListener): () => void {
@@ -98,59 +126,83 @@ export async function getQueuedPhotos(projectId?: string): Promise<QueuedPhoto[]
 }
 
 export async function enqueuePhoto(item: QueuedPhoto): Promise<QueuedPhoto> {
-  const source = new File(item.localUri);
-  const destination = new File(offlineDirectory(), `${item.id}.jpg`);
-  if (destination.exists) {
-    destination.delete();
-  }
-  await source.copy(destination);
-  const stored: QueuedPhoto = { ...item, localUri: destination.uri };
+  const stored: QueuedPhoto = {
+    ...item,
+    originalUri: copyIntoQueue(item.originalUri, `${item.id}-original.jpg`),
+    stampedUri: copyIntoQueue(item.stampedUri, `${item.id}-stamped.jpg`),
+    syncError: null,
+  };
   const items = await readQueue();
   items.push(stored);
   await writeQueue(items);
   return stored;
 }
 
+export async function updateQueuedPhotoNote(id: string, note: string): Promise<void> {
+  const items = await readQueue();
+  await writeQueue(items.map((item) => (item.id === id ? { ...item, note } : item)));
+}
+
+async function deleteQueuedFile(uri: string) {
+  try {
+    const file = new File(uri);
+    if (file.exists) {
+      file.delete();
+    }
+  } catch {
+    // A missing file should not block the rest of the queue.
+  }
+}
+
 export async function removeQueuedPhoto(id: string): Promise<void> {
   const items = await readQueue();
   const current = items.find((item) => item.id === id);
   if (current) {
-    try {
-      const file = new File(current.localUri);
-      if (file.exists) {
-        file.delete();
-      }
-    } catch {
-      // The queue entry is still removed so a missing file cannot block sync.
-    }
+    await deleteQueuedFile(current.originalUri);
+    await deleteQueuedFile(current.stampedUri);
   }
   await writeQueue(items.filter((item) => item.id !== id));
 }
 
-async function uploadQueuedPhoto(item: QueuedPhoto): Promise<void> {
-  const [{ getDb }, { getDownloadURL, getProjectStorage, ref }, { doc, updateDoc }, { requireIdToken }] =
-    await Promise.all([
-      import('@/lib/firebase'),
-      import('@/lib/firebase-storage'),
-      import('@/lib/firestore'),
-      import('@/lib/firebase-auth'),
-    ]);
-  const bytes = decodeBase64(await withTimeout(new File(item.localUri).base64(), 15000));
+export async function clearQueueForUser(userId: string): Promise<void> {
+  const items = await readQueue();
+  await Promise.all(items.filter((item) => item.userId === userId).map((item) => removeQueuedPhoto(item.id)));
+}
+
+async function readJpeg(uri: string): Promise<Uint8Array> {
+  const bytes = decodeBase64(await new File(uri).base64());
   if (bytes.length < 3 || bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes[2] !== 0xff) {
-    throw new Error('The saved photo could not be read as an image.');
+    throw new Error('The saved photo could not be read as a JPEG.');
   }
-  const objectPath = `users/${item.userId}/projects/${item.projectId}/${item.locationId}-${item.stage}-${Date.now()}.jpg`;
-  const storageRef = ref(getProjectStorage(), objectPath);
-  await uploadJpeg(storageRef.bucket, objectPath, bytes, await requireIdToken());
-  const downloadUrl = await getDownloadURL(storageRef);
-  await updateDoc(doc(getDb(), 'projects', item.projectId, 'locations', item.locationId), {
-    [item.stage]: {
-      downloadUrl,
-      capturedAt: item.capturedAt,
-      location: item.location,
-      note: item.note || '',
-    },
-  });
+  return bytes;
+}
+
+function draftFromQueue(item: QueuedPhoto, originalBytes: Uint8Array, stampedBytes: Uint8Array): EvidenceDraft {
+  return {
+    projectId: item.projectId,
+    locationId: item.locationId,
+    evidenceId: item.evidenceId,
+    stage: item.stage,
+    source: item.source,
+    originalBytes,
+    stampedBytes,
+    originalSha256: item.originalSha256,
+    originalPath: item.originalPath,
+    stampedPath: item.stampedPath,
+    deviceCapturedAt: item.deviceCapturedAt,
+    latitude: item.latitude,
+    longitude: item.longitude,
+    accuracy: item.accuracy,
+    note: item.note,
+    product: item.product,
+    batch: item.batch,
+    itemCode: item.itemCode,
+    jobReference: item.jobReference,
+    operativeUid: item.operativeUid,
+    operativeName: item.operativeName,
+    correctionOf: item.correctionOf,
+    driftMs: null,
+  };
 }
 
 export async function syncOfflineQueue(options?: { force?: boolean }): Promise<void> {
@@ -177,10 +229,13 @@ export async function syncOfflineQueue(options?: { force?: boolean }): Promise<v
     const items = (await readQueue()).filter((item) => item.userId === user.uid);
     for (const item of items) {
       try {
-        await withTimeout(uploadQueuedPhoto(item), 30000);
+        const draft = draftFromQueue(item, await readJpeg(item.originalUri), await readJpeg(item.stampedUri));
+        await commitEvidence(draft);
         await removeQueuedPhoto(item.id);
-      } catch {
-        // Leave the photo queued so the next connection can retry it.
+      } catch (error) {
+        const message = error instanceof Error && error.message ? error.message : 'Could not sync this photo.';
+        const latest = await readQueue();
+        await writeQueue(latest.map((queued) => (queued.id === item.id ? { ...queued, syncError: message } : queued)));
       }
     }
   } finally {

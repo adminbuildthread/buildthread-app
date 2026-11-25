@@ -13,8 +13,11 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
+import { privacyPolicyUrl } from '@/constants/legal';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
+import { openExternalUrl } from '@/lib/open-url';
+import { passwordIssue } from '@/lib/password';
 
 function authErrorMessage(error: unknown): string {
   const code = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : '';
@@ -25,7 +28,7 @@ function authErrorMessage(error: unknown): string {
     return 'That email is already in use. Sign in instead.';
   }
   if (code.includes('weak-password')) {
-    return 'Use a password with at least 6 characters.';
+    return 'Use at least 10 characters, with a letter and a number.';
   }
   if (code.includes('invalid-credential') || code.includes('wrong-password') || code.includes('user-not-found')) {
     return 'Email or password is incorrect.';
@@ -56,9 +59,12 @@ export default function LoginScreen() {
       setErrorMessage(!trimmedEmail ? 'Enter your email address.' : 'Enter your password.');
       return;
     }
-    if (password.length < 6) {
-      setErrorMessage('Use a password with at least 6 characters.');
-      return;
+    if (mode === 'create') {
+      const issue = passwordIssue(password);
+      if (issue) {
+        setErrorMessage(issue);
+        return;
+      }
     }
 
     setIsSubmitting(true);
@@ -69,7 +75,9 @@ export default function LoginScreen() {
       );
       const auth = getProjectAuth();
       if (mode === 'create') {
-        await createUserWithEmailAndPassword(auth, trimmedEmail, password);
+        const { sendEmailVerification } = await import('@/lib/firebase-auth');
+        const credential = await createUserWithEmailAndPassword(auth, trimmedEmail, password);
+        await sendEmailVerification(credential.user);
       } else {
         await signInWithEmailAndPassword(auth, trimmedEmail, password);
       }
@@ -90,7 +98,7 @@ export default function LoginScreen() {
             </ThemedText>
             <ThemedText style={styles.title}>{mode === 'create' ? 'Create account' : 'Sign in'}</ThemedText>
             <ThemedText type="small" themeColor="textSecondary">
-              Use the email and password for this handyman account.
+              Use the email and password for this BuildThread account.
             </ThemedText>
 
             <View style={[styles.toggle, { backgroundColor: theme.backgroundElement }]}>
@@ -136,6 +144,9 @@ export default function LoginScreen() {
             />
             {errorMessage ? <Text style={styles.error}>{errorMessage}</Text> : null}
 
+            <Pressable accessibilityRole="link" onPress={() => void openExternalUrl(privacyPolicyUrl())}>
+              <Text style={styles.privacy}>Privacy policy</Text>
+            </Pressable>
             <Pressable
               accessibilityRole="button"
               accessibilityState={{ disabled: isSubmitting }}
@@ -205,6 +216,12 @@ const styles = StyleSheet.create({
     color: '#B42318',
     fontSize: 14,
     lineHeight: 20,
+  },
+  privacy: {
+    color: '#208AEF',
+    fontSize: 15,
+    lineHeight: 20,
+    fontWeight: '600',
   },
   submit: {
     minHeight: 56,

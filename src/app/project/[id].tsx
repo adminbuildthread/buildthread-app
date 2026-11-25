@@ -1,11 +1,12 @@
 import { requireOptionalNativeModule } from 'expo';
+import { File } from 'expo-file-system';
 import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
 import * as Location from 'expo-location';
 import { Stack, useLocalSearchParams } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 import { Ionicons } from '@expo/vector-icons';
-import { Fragment, useEffect, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -23,13 +24,26 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { EvidenceStamp } from '@/components/evidence-stamp';
 import { PhotoCapture } from '@/components/photo-capture';
 import { StageReminderSheet } from '@/components/stage-reminder-sheet';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
-import { decodeBase64, uploadJpeg } from '@/lib/upload-jpeg';
+import { commitEvidence, commitNoteCorrection, readCaptureContext } from '@/lib/commit-evidence';
+import {
+  createEvidenceId,
+  evidenceObjectPaths,
+  latestEvidenceFor,
+  readEvidence,
+  type EvidenceRecord,
+} from '@/lib/evidence-record';
+import { cacheProjectDetail, readCachedProjectDetail } from '@/lib/local-cache';
+import { prepareCapture, type PreparedCapture } from '@/lib/prepare-capture';
+import { archiveLocation, completeProject, reopenProject as reopenStoredProject, saveLocationDetails } from '@/lib/project-actions';
+import { decodeBase64 } from '@/lib/upload-jpeg';
+import type { QueuedPhoto } from '@/utils/offlineQueue';
 import { buildPendingCompliance, readPendingCompliance, samePendingCompliance } from '@/utils/pendingCompliance';
 import { formatReminderWhen } from '@/utils/reminder-format';
 
@@ -41,9 +55,17 @@ type GpsPoint = {
 type PhotoSlot = {
   downloadUrl: string;
   capturedAt?: string;
+  serverCapturedAt?: string;
   location?: GpsPoint | null;
   note?: string;
   pending?: boolean;
+  queueId?: string;
+  evidenceId?: string;
+  importedUnverified?: boolean;
+  sha256?: string;
+  operativeName?: string;
+  driftFlag?: boolean | null;
+  record?: EvidenceRecord;
 };
 
 type SelectedPhoto = {
@@ -59,6 +81,10 @@ type ProjectLocation = {
   id: string;
   name: string;
   order: number;
+  itemCode: string;
+  product: string;
+  batch: string;
+  archived: boolean;
   before: PhotoSlot | null;
   during: PhotoSlot | null;
   after: PhotoSlot | null;
@@ -151,7 +177,7 @@ function uploadErrorMessage(error: unknown): string {
 
 type ProjectMode = 'compliance' | 'quick';
 
-type ProjectStatus = 'active' | 'completed';
+type ProjectStatus = 'active' | 'completed' | 'archived';
 
 function todayUkDate(): string {
   const parts = new Intl.DateTimeFormat('en-GB', {
@@ -170,16 +196,19 @@ async function readProjectFields(projectId: string): Promise<{
   projectMode: ProjectMode;
   status: ProjectStatus;
   endDate: string;
+  jobReference: string;
 }> {
   const [{ doc, getDoc }, { getDb }] = await Promise.all([
     import('@/lib/firestore'),
     import('@/lib/firebase'),
   ]);
   const data = (await getDoc(doc(getDb(), 'projects', projectId))).data();
+  const status = data?.status === 'completed' ? 'completed' : data?.status === 'archived' ? 'archived' : 'active';
   return {
     projectMode: data?.projectMode === 'quick' ? 'quick' : 'compliance',
-    status: data?.status === 'completed' ? 'completed' : 'active',
+    status,
     endDate: typeof data?.endDate === 'string' ? data.endDate : '',
+    jobReference: typeof data?.jobReference === 'string' ? data.jobReference : '',
   };
 }
 
@@ -200,16 +229,6 @@ function filledCount(location: ProjectLocation): number {
 
 function stageLabel(stage: SlotStage): string {
   return SLOT_STAGES.find((item) => item.key === stage)?.label ?? stage;
-}
-
-function laterStageLabel(location: ProjectLocation, stage: SlotStage): string | null {
-  if (stage === 'before' && (location.during || location.after)) {
-    return location.during ? 'During' : 'After';
-  }
-  if (stage === 'during' && location.after) {
-    return 'After';
-  }
-  return null;
 }
 
 function isNetworkError(error: unknown): boolean {
@@ -247,22 +266,29 @@ export default function ProjectDetailsScreen() {
   const [projectMode, setProjectMode] = useState<ProjectMode | null>(null);
   const [projectStatus, setProjectStatus] = useState<ProjectStatus>('active');
   const [endDate, setEndDate] = useState('');
+  const [jobReference, setJobReference] = useState('');
+  const [evidence, setEvidence] = useState<EvidenceRecord[]>([]);
+  const [captureError, setCaptureError] = useState<string | null>(null);
+  const [gapPrompt, setGapPrompt] = useState(false);
+  const [gapReason, setGapReason] = useState('');
+  const [stampJob, setStampJob] = useState<{
+    uri: string;
+    lines: string[];
+    prepared: PreparedCapture;
+    locationId: string;
+    stage: SlotStage;
+    note: string;
+    itemCode: string;
+    product: string;
+    batch: string;
+    correctionOf: string | null;
+  } | null>(null);
   const [isUpdatingStatus, setIsUpdatingStatus] = useState(false);
   const [uploadingSlot, setUploadingSlot] = useState<string | null>(null);
   const [cameraTarget, setCameraTarget] = useState<{ locationId: string; stage: SlotStage } | null>(null);
   const [isAddingLocation, setIsAddingLocation] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
-  const [queuedPhotos, setQueuedPhotos] = useState<
-    {
-      id: string;
-      locationId: string;
-      stage: SlotStage;
-      localUri: string;
-      capturedAt: string;
-      location: { latitude: number; longitude: number } | null;
-      note?: string;
-    }[]
-  >([]);
+  const [queuedPhotos, setQueuedPhotos] = useState<QueuedPhoto[]>([]);
   const [isSyncingQueue, setIsSyncingQueue] = useState(false);
   const [selectedPhoto, setSelectedPhoto] = useState<SelectedPhoto | null>(null);
   const [photoExpanded, setPhotoExpanded] = useState(false);
@@ -280,6 +306,7 @@ export default function ProjectDetailsScreen() {
   } | null>(null);
   const pendingSyncVersion = useRef(0);
   const dictatedBaseRef = useRef('');
+  const correctionRef = useRef<string | null>(null);
   const interimNoteRef = useRef('');
   const dictationListeners = useRef<{ remove: () => void }[]>([]);
   const { height: windowHeight } = useWindowDimensions();
@@ -335,19 +362,45 @@ export default function ProjectDetailsScreen() {
     };
   }, [id, isNewProject]);
 
-  const displayLocation = (location: ProjectLocation): ProjectLocation => {
+  const displayLocation = useCallback((location: ProjectLocation): ProjectLocation => {
     const slot = (stage: SlotStage): PhotoSlot | null => {
       const pending = queuedPhotos.find((item) => item.locationId === location.id && item.stage === stage);
-      if (!pending) {
-        return location[stage];
+      if (pending) {
+        return {
+          downloadUrl: pending.stampedUri,
+          capturedAt: pending.deviceCapturedAt ?? undefined,
+          location:
+            pending.latitude != null && pending.longitude != null
+              ? { latitude: pending.latitude, longitude: pending.longitude }
+              : null,
+          note: pending.note,
+          pending: true,
+          queueId: pending.id,
+          importedUnverified: pending.source === 'imported',
+          sha256: pending.originalSha256,
+          operativeName: pending.operativeName,
+        };
       }
-      return {
-        downloadUrl: pending.localUri,
-        capturedAt: pending.capturedAt,
-        location: pending.location,
-        note: pending.note,
-        pending: true,
-      };
+      const record = latestEvidenceFor(evidence, location.id, stage);
+      if (record) {
+        return {
+          downloadUrl: record.stampedUrl || record.originalUrl,
+          capturedAt: record.deviceCapturedAt ?? undefined,
+          serverCapturedAt: record.serverCapturedAt ?? undefined,
+          location:
+            record.latitude != null && record.longitude != null
+              ? { latitude: record.latitude, longitude: record.longitude }
+              : null,
+          note: record.note,
+          evidenceId: record.id,
+          importedUnverified: record.importedUnverified,
+          sha256: record.originalSha256,
+          operativeName: record.operativeName,
+          driftFlag: record.clockDriftFlag,
+          record,
+        };
+      }
+      return location[stage];
     };
     return {
       ...location,
@@ -355,7 +408,7 @@ export default function ProjectDetailsScreen() {
       during: slot('during'),
       after: slot('after'),
     };
-  };
+  }, [evidence, queuedPhotos]);
 
   useEffect(() => {
     if (!id || isNewProject) {
@@ -387,6 +440,10 @@ export default function ProjectDetailsScreen() {
                 id: locationDoc.id,
                 name: typeof data.name === 'string' && data.name.trim() ? data.name.trim() : 'Location',
                 order: typeof data.order === 'number' ? data.order : 0,
+                itemCode: typeof data.itemCode === 'string' ? data.itemCode : '',
+                product: typeof data.product === 'string' ? data.product : '',
+                batch: typeof data.batch === 'string' ? data.batch : '',
+                archived: data.archived === true,
                 before: readSlot(data.before),
                 during: readSlot(data.during),
                 after: readSlot(data.after),
@@ -419,7 +476,18 @@ export default function ProjectDetailsScreen() {
             })();
           },
           (error) => {
-            setLocationsError(error.message);
+            void readCachedProjectDetail<{ locations?: ProjectLocation[] }>(id).then((cached) => {
+              if (!active) {
+                return;
+              }
+              if (cached?.locations?.length) {
+                setLocations(cached.locations);
+                setLocationsLoaded(true);
+                setLocationsError(null);
+                return;
+              }
+              setLocationsError(error.message);
+            });
           },
         );
       })
@@ -438,6 +506,51 @@ export default function ProjectDetailsScreen() {
 
   useEffect(() => {
     if (!id || isNewProject) {
+      setEvidence([]);
+      return;
+    }
+    let unsubscribe = () => {};
+    let active = true;
+    Promise.all([import('@/lib/firestore'), import('@/lib/firebase')])
+      .then(([{ collection, onSnapshot }, { getDb }]) => {
+        if (!active) {
+          return;
+        }
+        unsubscribe = onSnapshot(
+          collection(getDb(), 'projects', id, 'evidence'),
+          (snapshot) => {
+            setEvidence(
+              snapshot.docs.flatMap((item) => {
+                const record = readEvidence(item.id, item.data());
+                return record ? [record] : [];
+              }),
+            );
+          },
+          () => {
+            void readCachedProjectDetail<{ evidence?: EvidenceRecord[] }>(id).then((cached) => {
+              if (active && cached?.evidence) {
+                setEvidence(cached.evidence);
+              }
+            });
+          },
+        );
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [id, isNewProject]);
+
+  useEffect(() => {
+    if (!id || isNewProject || !locationsLoaded) {
+      return;
+    }
+    void cacheProjectDetail(id, { locations, evidence, projectMode, projectStatus, endDate, jobReference });
+  }, [endDate, evidence, id, isNewProject, jobReference, locations, locationsLoaded, projectMode, projectStatus]);
+
+  useEffect(() => {
+    if (!id || isNewProject) {
       setProjectMode(null);
       return;
     }
@@ -449,6 +562,7 @@ export default function ProjectDetailsScreen() {
           setProjectMode(fields.projectMode);
           setProjectStatus(fields.status);
           setEndDate(fields.endDate);
+          setJobReference(fields.jobReference);
         }
       })
       .catch(() => {
@@ -492,7 +606,7 @@ export default function ProjectDetailsScreen() {
     return () => {
       active = false;
     };
-  }, [id, isNewProject, locations, locationsLoaded, projectMode, queuedPhotos]);
+  }, [displayLocation, evidence, id, isNewProject, locations, locationsLoaded, projectMode, queuedPhotos]);
 
   const addLocation = async () => {
     if (!id || isNewProject || isAddingLocation) {
@@ -505,13 +619,22 @@ export default function ProjectDetailsScreen() {
         import('@/lib/firebase'),
       ]);
       const nextOrder = locations.reduce((max, location) => Math.max(max, location.order), 0) + 1;
+      const itemCode = `L${locations.length + 1}`;
       const created = await addDoc(collection(getDb(), 'projects', id, 'locations'), {
         name: `Location ${locations.length + 1}`,
+        itemCode,
+        product: '',
+        batch: '',
+        archived: false,
         order: nextOrder,
         createdAt: serverTimestamp(),
-        before: null,
-        during: null,
-        after: null,
+      });
+      const { writeAudit } = await import('@/lib/audit');
+      await writeAudit({
+        projectId: id,
+        action: 'location_added',
+        summary: `Item ${itemCode} added.`,
+        locationId: created.id,
       });
       pendingFocusId.current = created.id;
       setLatestAddedId(created.id);
@@ -522,32 +645,29 @@ export default function ProjectDetailsScreen() {
     }
   };
 
-  const renameLocation = async (locationId: string, nextName: string) => {
-    const trimmed = nextName.trim();
-    const current = locations.find((location) => location.id === locationId);
-    if (!trimmed || !current || trimmed === current.name) {
+  const choosePhotoSource = (locationId: string, stage: SlotStage, correctionOf: string | null = null) => {
+    if (uploadingSlot || stampJob) {
       return;
     }
-    try {
-      const [{ doc, updateDoc }, { getDb }] = await Promise.all([
-        import('@/lib/firestore'),
-        import('@/lib/firebase'),
-      ]);
-      await updateDoc(doc(getDb(), 'projects', id, 'locations', locationId), { name: trimmed });
-    } catch (error) {
-      Alert.alert('Could not rename location', uploadErrorMessage(error));
-    }
-  };
-
-  const choosePhotoSource = (locationId: string, stage: SlotStage) => {
-    if (uploadingSlot) {
+    const location = locations.find((item) => item.id === locationId);
+    if (location?.archived || projectStatus === 'archived') {
+      Alert.alert('This record is archived', 'Archived work keeps its photos and does not take new ones.');
       return;
     }
-    Alert.alert('Add photo', 'Choose how to add this photo.', [
-      { text: 'Take Photo', onPress: () => openCamera(locationId, stage) },
-      { text: 'Upload Gallery', onPress: () => void captureSlot(locationId, stage, 'gallery') },
-      { text: 'Cancel', style: 'cancel' },
-    ]);
+    correctionRef.current = correctionOf;
+    if (!isQuick) {
+      openCamera(locationId, stage);
+      return;
+    }
+    Alert.alert(
+      'Add photo',
+      'Gallery photos are marked imported, unverified. Their time and GPS come only from the file, never from the phone clock or the current position.',
+      [
+        { text: 'Take Photo', onPress: () => openCamera(locationId, stage) },
+        { text: 'Import unverified', onPress: () => void captureSlot(locationId, stage, 'gallery') },
+        { text: 'Cancel', style: 'cancel' },
+      ],
+    );
   };
 
   const openCamera = (locationId: string, stage: SlotStage) => {
@@ -582,8 +702,8 @@ export default function ProjectDetailsScreen() {
 
     const result =
       source === 'camera'
-        ? await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], quality: 0.6, base64: true })
-        : await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.6, base64: true });
+        ? await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], quality: 1, base64: true, exif: true })
+        : await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 1, base64: true, exif: true });
 
     const asset = result.canceled ? null : result.assets[0];
     const imageBase64 = asset?.base64;
@@ -591,120 +711,207 @@ export default function ProjectDetailsScreen() {
     if (!imageBase64 || !imageUri) {
       return;
     }
-    await saveCapturedPhoto(locationId, stage, imageBase64, imageUri);
+    await beginEvidence(locationId, stage, source === 'gallery' ? 'imported' : 'camera', imageBase64, imageUri, asset?.exif);
   };
 
-  const saveCapturedPhoto = async (locationId: string, stage: SlotStage, imageBase64: string, imageUri: string) => {
+  const beginEvidence = async (
+    locationId: string,
+    stage: SlotStage,
+    source: 'camera' | 'imported',
+    imageBase64: string,
+    imageUri: string,
+    exif: unknown,
+  ) => {
     if (!id || isNewProject || uploadingSlot) {
       return;
     }
-
     const slotKey = `${locationId}:${stage}`;
-    const clearStageReminder = () => {
-      if (stage !== 'during' && stage !== 'after') {
-        return;
-      }
-      void import('@/utils/reminders').then(({ cancelStageReminder }) => cancelStageReminder(id, locationId, stage));
-    };
     setUploadingSlot(slotKey);
+    setCaptureError(null);
     try {
       const mode = projectMode ?? (await readProjectMode(id));
       if (projectMode == null) {
         setProjectMode(mode);
       }
-
-      let photoLocation: { latitude: number; longitude: number } | null = null;
+      const compliance = mode !== 'quick';
+      if (compliance && source === 'imported') {
+        throw new Error('Compliance jobs only accept photos taken in the camera.');
+      }
       const NetInfo = await import('@react-native-community/netinfo');
       const connection = await NetInfo.fetch();
       const offline = !connection.isConnected || connection.isInternetReachable === false;
-      if (mode !== 'quick') {
+      let gps: { latitude: number; longitude: number; accuracy: number | null } | null = null;
+      if (source === 'camera') {
         const permission = await Location.requestForegroundPermissionsAsync();
-        if (!permission.granted) {
-          Alert.alert('Location needed', 'Allow location access so this evidence can be tagged.');
-          return;
+        if (!permission.granted && compliance) {
+          throw new Error('Allow location access so this compliance photo can be tagged. The photo was not saved.');
         }
-
-        try {
-          const position = await Location.getCurrentPositionAsync({});
-          photoLocation = {
-            latitude: position.coords.latitude,
-            longitude: position.coords.longitude,
-          };
-        } catch (error) {
-          if (!offline) {
-            throw error;
+        if (permission.granted) {
+          try {
+            const position = await Location.getCurrentPositionAsync({});
+            gps = {
+              latitude: position.coords.latitude,
+              longitude: position.coords.longitude,
+              accuracy: position.coords.accuracy ?? null,
+            };
+          } catch {
+            if (compliance) {
+              throw new Error(
+                offline
+                  ? 'Could not read GPS while offline. This photo was not saved. Wait for a location fix, then take it again.'
+                  : 'Could not read GPS. This photo was not saved.',
+              );
+            }
+            setCaptureError('This Quick Log photo has no GPS fix.');
           }
         }
       }
-
-      const capturedAt = new Date().toISOString();
-      const bytes = decodeBase64(imageBase64);
-      if (bytes.length < 3 || bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes[2] !== 0xff) {
-        throw new Error('The selected photo could not be read as an image.');
+      let context = {
+        operativeUid: '',
+        operativeName: 'Operative',
+        jobReference,
+      };
+      try {
+        context = await readCaptureContext(id);
+        setJobReference(context.jobReference);
+      } catch {
+        const { getProjectAuth, requireUserId } = await import('@/lib/firebase-auth');
+        context = {
+          operativeUid: requireUserId(),
+          operativeName: getProjectAuth().currentUser?.email || 'Operative',
+          jobReference,
+        };
       }
-      const existingNote = locations.find((item) => item.id === locationId)?.[stage]?.note?.trim() ?? '';
-      const draftNote =
-        selectedPhoto?.locationId === locationId && selectedPhoto.stage === stage ? noteText.trim() : '';
-      const note = draftNote || existingNote;
+      const place = locations.find((item) => item.id === locationId);
+      const prepared = await prepareCapture({
+        base64: imageBase64,
+        source,
+        exif,
+        compliance,
+        gps,
+        jobReference: context.jobReference,
+        itemCode: place?.itemCode || locationId,
+        operativeName: context.operativeName,
+      });
+      const existingNote = place?.[stage]?.note?.trim() ?? '';
+      const draftNote = selectedPhoto?.locationId === locationId && selectedPhoto.stage === stage ? noteText.trim() : '';
+      setStampJob({
+        uri: imageUri,
+        lines: prepared.lines,
+        prepared,
+        locationId,
+        stage,
+        note: draftNote || existingNote,
+        itemCode: place?.itemCode || '',
+        product: place?.product || '',
+        batch: place?.batch || '',
+        correctionOf: correctionRef.current,
+      });
+    } catch (error) {
+      const message = uploadErrorMessage(error);
+      setCaptureError(message);
+      Alert.alert('Photo not saved', message);
+    } finally {
+      setUploadingSlot(null);
+    }
+  };
+
+  const finishStampedPhoto = async (stampedUri: string) => {
+    const job = stampJob;
+    if (!job || !id) {
+      return;
+    }
+    setStampJob(null);
+    const slotKey = `${job.locationId}:${job.stage}`;
+    setUploadingSlot(slotKey);
+    try {
+      const { enqueuePhoto } = await import('@/utils/offlineQueue');
+      const { requireUserId } = await import('@/lib/firebase-auth');
+      const userId = requireUserId();
+      const evidenceId = createEvidenceId();
+      const paths = evidenceObjectPaths(userId, id, job.locationId, evidenceId);
+      const stampedBytes = decodeBase64(await new File(stampedUri).base64());
+      const NetInfo = await import('@react-native-community/netinfo');
+      const connection = await NetInfo.fetch();
+      const offline = !connection.isConnected || connection.isInternetReachable === false;
+      const queueItem: QueuedPhoto = {
+        id: evidenceId,
+        evidenceId,
+        userId,
+        projectId: id,
+        locationId: job.locationId,
+        stage: job.stage,
+        originalUri: job.uri,
+        stampedUri,
+        originalSha256: job.prepared.originalSha256,
+        originalPath: paths.originalPath,
+        stampedPath: paths.stampedPath,
+        deviceCapturedAt: job.prepared.deviceCapturedAt,
+        latitude: job.prepared.latitude,
+        longitude: job.prepared.longitude,
+        accuracy: job.prepared.accuracy,
+        note: job.note,
+        source: job.prepared.source,
+        product: job.product,
+        batch: job.batch,
+        itemCode: job.itemCode,
+        jobReference,
+        operativeUid: userId,
+        operativeName: job.lines[job.lines.length - 1] || 'Operative',
+        correctionOf: job.correctionOf,
+        syncError: null,
+      };
       const saveOffline = async () => {
-        const [{ enqueuePhoto }, { requireUserId }] = await Promise.all([
-          import('@/utils/offlineQueue'),
-          import('@/lib/firebase-auth'),
-        ]);
-        await enqueuePhoto({
-          id: `${Date.now()}-${locationId}-${stage}`,
-          userId: requireUserId(),
-          projectId: id,
-          locationId,
-          stage,
-          localUri: imageUri,
-          capturedAt,
-          location: photoLocation,
-          ...(note ? { note } : {}),
-        });
-        Alert.alert('Saved offline', 'Saved offline — will sync automatically when online.');
-        clearStageReminder();
+        await enqueuePhoto(queueItem);
+        Alert.alert('Saved offline', 'Saved on this phone. It will sync when you are online. Use Sync Now if it needs a retry.');
       };
       if (offline) {
         await saveOffline();
-        return;
-      }
-      try {
-        const [{ getDb }, { ref, getDownloadURL, getProjectStorage }, firestoreApi, { requireIdToken, requireUserId }] =
-          await Promise.all([
-            import('@/lib/firebase'),
-            import('@/lib/firebase-storage'),
-            import('@/lib/firestore'),
-            import('@/lib/firebase-auth'),
-          ]);
-        const objectPath = `users/${requireUserId()}/projects/${id}/evidence/evidence_${Date.now()}.jpeg`;
-        const storageRef = ref(getProjectStorage(), objectPath);
-        await uploadJpeg(storageRef.bucket, objectPath, bytes, await requireIdToken());
-        const downloadUrl = await getDownloadURL(storageRef);
-        const slotPhoto: PhotoSlot = {
-          downloadUrl,
-          capturedAt,
-          location: photoLocation,
-          ...(note ? { note } : {}),
-        };
-        await firestoreApi.updateDoc(firestoreApi.doc(getDb(), 'projects', id, 'locations', locationId), {
-          [stage]: slotPhoto,
-        });
-        clearStageReminder();
-        setSelectedPhoto((current) => {
-          if (!current || current.locationId !== locationId || current.stage !== stage) {
-            return current;
+      } else {
+        try {
+          await commitEvidence({
+            projectId: id,
+            locationId: job.locationId,
+            evidenceId,
+            stage: job.stage,
+            source: job.prepared.source,
+            originalBytes: job.prepared.originalBytes,
+            stampedBytes,
+            originalSha256: job.prepared.originalSha256,
+            originalPath: paths.originalPath,
+            stampedPath: paths.stampedPath,
+            deviceCapturedAt: job.prepared.deviceCapturedAt,
+            latitude: job.prepared.latitude,
+            longitude: job.prepared.longitude,
+            accuracy: job.prepared.accuracy,
+            note: job.note,
+            product: job.product,
+            batch: job.batch,
+            itemCode: job.itemCode,
+            jobReference,
+            operativeUid: userId,
+            operativeName: queueItem.operativeName,
+            correctionOf: job.correctionOf,
+            driftMs: null,
+          });
+        } catch (error) {
+          if (!isNetworkError(error)) {
+            throw error;
           }
-          return { ...current, photoData: slotPhoto };
-        });
-      } catch (error) {
-        if (!isNetworkError(error)) {
-          throw error;
+          await saveOffline();
         }
-        await saveOffline();
       }
+      const reminderStage = job.stage === 'during' || job.stage === 'after' ? job.stage : null;
+      if (reminderStage) {
+        void import('@/utils/reminders').then(({ cancelStageReminder }) =>
+          cancelStageReminder(id, job.locationId, reminderStage),
+        );
+      }
+      setCaptureError(null);
     } catch (error) {
-      Alert.alert('Upload failed', uploadErrorMessage(error));
+      const message = uploadErrorMessage(error);
+      setCaptureError(message);
+      Alert.alert('Upload failed', message);
     } finally {
       setUploadingSlot(null);
     }
@@ -838,18 +1045,17 @@ export default function ProjectDetailsScreen() {
     setIsSavingNote(true);
     try {
       await stopDictation();
-      const [{ doc, updateDoc }, { getDb }] = await Promise.all([
-        import('@/lib/firestore'),
-        import('@/lib/firebase'),
-      ]);
       const note = dictatedBaseRef.current.trim();
-      await updateDoc(doc(getDb(), 'projects', id, 'locations', selectedPhoto.locationId), {
-        [`${selectedPhoto.stage}.note`]: note,
-      });
+      if (selectedPhoto.photoData.pending && selectedPhoto.photoData.queueId) {
+        const { updateQueuedPhotoNote } = await import('@/utils/offlineQueue');
+        await updateQueuedPhotoNote(selectedPhoto.photoData.queueId, note);
+      } else if (selectedPhoto.photoData.record) {
+        await commitNoteCorrection(selectedPhoto.photoData.record, id, note);
+      } else {
+        throw new Error('This older photo has no locked record yet. Add a correction photo to attach a note.');
+      }
       setSelectedPhoto((current) =>
-        current
-          ? { ...current, photoData: { ...current.photoData, note: note || undefined } }
-          : current,
+        current ? { ...current, photoData: { ...current.photoData, note: note || undefined } } : current,
       );
     } catch (error) {
       Alert.alert('Could not save note', uploadErrorMessage(error));
@@ -863,25 +1069,25 @@ export default function ProjectDetailsScreen() {
       return;
     }
     if (uploadingSlot?.startsWith(`${locationId}:`)) {
-      Alert.alert('Photo still saving', 'Wait for the photo to finish before deleting this location.');
+      Alert.alert('Photo still saving', 'Wait for the photo to finish before archiving this item.');
       return;
     }
-    Alert.alert('Delete location?', `Remove ${locationName} and its photos?`, [
+    Alert.alert('Archive this item?', `${locationName} stays in the record with its photos. It will not take new photos.`, [
       { text: 'Cancel', style: 'cancel' },
-      { text: 'Delete', style: 'destructive', onPress: () => void confirmDeleteLocation(locationId) },
+      {
+        text: 'Archive',
+        style: 'destructive',
+        onPress: () => void confirmArchiveLocation(locationId, locationName),
+      },
     ]);
   };
 
-  const confirmDeleteLocation = async (locationId: string) => {
+  const confirmArchiveLocation = async (locationId: string, locationName: string) => {
     if (!id) {
       return;
     }
     try {
-      const [{ deleteDoc, doc }, { getDb }] = await Promise.all([
-        import('@/lib/firestore'),
-        import('@/lib/firebase'),
-      ]);
-      await deleteDoc(doc(getDb(), 'projects', id, 'locations', locationId));
+      await archiveLocation(id, locationId, locationName);
       if (selectedPhoto?.locationId === locationId) {
         closePhoto();
       }
@@ -892,48 +1098,8 @@ export default function ProjectDetailsScreen() {
           cancelStageReminder(projectId, locationId, 'after'),
         ]),
       );
-      void import('@/utils/offlineQueue').then(async ({ getQueuedPhotos, removeQueuedPhoto }) => {
-        const queued = await getQueuedPhotos(projectId);
-        await Promise.all(queued.filter((item) => item.locationId === locationId).map((item) => removeQueuedPhoto(item.id)));
-      });
     } catch (error) {
-      Alert.alert('Could not delete location', uploadErrorMessage(error));
-    }
-  };
-
-  const deletePhoto = () => {
-    if (!selectedPhoto) {
-      return;
-    }
-    const location = locations.find((item) => item.id === selectedPhoto.locationId);
-    const laterStage = location && projectMode === 'compliance' ? laterStageLabel(location, selectedPhoto.stage) : null;
-    if (laterStage) {
-      Alert.alert(
-        'Delete the later photo first',
-        `${laterStage} still has a photo. Delete that photo first, or use Retake to replace this one.`,
-      );
-      return;
-    }
-    Alert.alert('Delete photo', 'Remove this photo from the location?', [
-      { text: 'Cancel', style: 'cancel' },
-      { text: 'Delete', style: 'destructive', onPress: () => void confirmDeletePhoto() },
-    ]);
-  };
-
-  const confirmDeletePhoto = async () => {
-    if (!selectedPhoto || !id) {
-      return;
-    }
-    const { locationId, stage } = selectedPhoto;
-    try {
-      const [{ doc, updateDoc }, { getDb }] = await Promise.all([
-        import('@/lib/firestore'),
-        import('@/lib/firebase'),
-      ]);
-      await updateDoc(doc(getDb(), 'projects', id, 'locations', locationId), { [stage]: null });
-      closePhoto();
-    } catch (error) {
-      Alert.alert('Could not delete photo', uploadErrorMessage(error));
+      Alert.alert('Could not archive item', uploadErrorMessage(error));
     }
   };
 
@@ -955,26 +1121,20 @@ export default function ProjectDetailsScreen() {
     }
   };
 
-  const confirmComplete = async () => {
+  const confirmComplete = async (reason: string | null) => {
     if (!id || isNewProject || isUpdatingStatus) {
       return;
     }
     setIsUpdatingStatus(true);
     try {
-      const [{ doc, serverTimestamp, updateDoc }, { getDb }] = await Promise.all([
-        import('@/lib/firestore'),
-        import('@/lib/firebase'),
-      ]);
       const nextEndDate = endDate.trim() ? undefined : todayUkDate();
-      await updateDoc(doc(getDb(), 'projects', id), {
-        status: 'completed',
-        completedAt: serverTimestamp(),
-        ...(nextEndDate ? { endDate: nextEndDate } : {}),
-      });
+      await completeProject(id, { reason, endDate: nextEndDate });
       if (nextEndDate) {
         setEndDate(nextEndDate);
       }
       setProjectStatus('completed');
+      setGapPrompt(false);
+      setGapReason('');
     } catch (error) {
       Alert.alert(
         'Could not complete project',
@@ -986,44 +1146,37 @@ export default function ProjectDetailsScreen() {
   };
 
   const markComplete = async () => {
-    if (!id || isNewProject || isUpdatingStatus) {
+    if (!id || isNewProject || isUpdatingStatus || projectStatus === 'archived') {
       return;
     }
     const mode = projectMode ?? (await readProjectMode(id));
     const missingEvidence =
       mode === 'compliance' &&
       locations.some((location) => {
+        if (location.archived) {
+          return false;
+        }
         const shown = displayLocation(location);
         return !shown.before || !shown.during || !shown.after;
       });
     if (missingEvidence) {
-      Alert.alert(
-        'Some compliance photos are missing',
-        'A location is still missing a Before, During, or After photo.',
-        [
-          { text: 'Cancel', style: 'cancel' },
-          { text: 'Complete Anyway', onPress: () => void confirmComplete() },
-        ],
-      );
+      setGapReason('');
+      setGapPrompt(true);
       return;
     }
     Alert.alert('Mark this job as complete?', undefined, [
       { text: 'Cancel', style: 'cancel' },
-      { text: 'Complete', onPress: () => void confirmComplete() },
+      { text: 'Complete', onPress: () => void confirmComplete(null) },
     ]);
   };
 
   const reopenProject = async () => {
-    if (!id || isNewProject || isUpdatingStatus) {
+    if (!id || isNewProject || isUpdatingStatus || projectStatus === 'archived') {
       return;
     }
     setIsUpdatingStatus(true);
     try {
-      const [{ doc, updateDoc }, { getDb }] = await Promise.all([
-        import('@/lib/firestore'),
-        import('@/lib/firebase'),
-      ]);
-      await updateDoc(doc(getDb(), 'projects', id), { status: 'active' });
+      await reopenStoredProject(id);
       setProjectStatus('active');
     } catch (error) {
       Alert.alert(
@@ -1052,12 +1205,26 @@ export default function ProjectDetailsScreen() {
                 {isNewProject ? 'New project' : isQuick ? 'Quick Log' : 'Compliance Job'}
               </ThemedText>
               {isNewProject ? null : (
-                <View style={[styles.statusPill, projectStatus === 'completed' ? styles.statusPillComplete : styles.statusPillActive]}>
-                  <Text style={styles.statusPillLabel}>{projectStatus === 'completed' ? 'Completed' : 'Active'}</Text>
+                <View style={[styles.statusPill, projectStatus === 'active' ? styles.statusPillActive : styles.statusPillComplete]}>
+                  <Text style={styles.statusPillLabel}>
+                    {projectStatus === 'archived' ? 'Archived' : projectStatus === 'completed' ? 'Completed' : 'Active'}
+                  </Text>
                 </View>
               )}
             </View>
             <ThemedText style={styles.title}>{title}</ThemedText>
+            {captureError ? <Text style={styles.errorText}>{captureError}</Text> : null}
+            {queuedPhotos.some((item) => item.syncError) ? (
+              <View style={styles.offlineBanner}>
+                {queuedPhotos
+                  .filter((item) => item.syncError)
+                  .map((item) => (
+                    <Text key={item.id} style={styles.offlineBannerLabel}>
+                      Sync failed for {item.itemCode || item.stage}: {item.syncError}
+                    </Text>
+                  ))}
+              </View>
+            ) : null}
             {queuedPhotos.length > 0 ? (
               <View style={styles.offlineBanner}>
                 <Text style={styles.offlineBannerLabel}>
@@ -1085,7 +1252,7 @@ export default function ProjectDetailsScreen() {
                 {isExporting ? <ActivityIndicator color={theme.text} /> : null}
                 <Text style={[styles.exportLabel, { color: theme.text }]}>{isExporting ? 'Exporting' : 'Export PDF'}</Text>
               </Pressable>
-              {isNewProject ? null : (
+              {isNewProject || projectStatus === 'archived' ? null : (
                 <Pressable
                   accessibilityRole="button"
                   accessibilityState={{ disabled: isUpdatingStatus }}
@@ -1105,8 +1272,8 @@ export default function ProjectDetailsScreen() {
             </View>
             <Pressable
               accessibilityRole="button"
-              accessibilityState={{ disabled: isNewProject || isAddingLocation }}
-              disabled={isNewProject || isAddingLocation}
+              accessibilityState={{ disabled: isNewProject || isAddingLocation || projectStatus === 'archived' }}
+              disabled={isNewProject || isAddingLocation || projectStatus === 'archived'}
               onPress={addLocation}
               style={[styles.addButton, (isNewProject || isAddingLocation) && styles.buttonDisabled]}>
               {isAddingLocation ? <ActivityIndicator color="#FFFFFF" /> : <Text style={styles.addIcon}>+</Text>}
@@ -1150,7 +1317,11 @@ export default function ProjectDetailsScreen() {
                     ? (uploadingSlot.slice(location.id.length + 1) as SlotStage)
                     : null
                 }
-                onRename={(nextName) => renameLocation(location.id, nextName)}
+                onSaveDetails={(details) =>
+                  void saveLocationDetails(id, location.id, details).catch((error) =>
+                    Alert.alert('Could not save item', uploadErrorMessage(error)),
+                  )
+                }
                 onDelete={() => deleteLocation(location.id, shown.name)}
                 onCapture={(stage) => choosePhotoSource(location.id, stage)}
                 onOpen={(stage) => openPhoto(shown, stage)}
@@ -1188,10 +1359,51 @@ export default function ProjectDetailsScreen() {
             onKeep={(shot) => {
               const target = cameraTarget;
               setCameraTarget(null);
-              void saveCapturedPhoto(target.locationId, target.stage, shot.base64, shot.uri);
+              void beginEvidence(target.locationId, target.stage, 'camera', shot.base64, shot.uri, null);
             }}
           />
         ) : null}
+        {stampJob ? (
+          <Modal animationType="fade" visible onRequestClose={() => setStampJob(null)}>
+            <EvidenceStamp
+              uri={stampJob.uri}
+              lines={stampJob.lines}
+              onStamped={(stampedUri) => void finishStampedPhoto(stampedUri)}
+              onError={(message) => {
+                setStampJob(null);
+                setCaptureError(message);
+                Alert.alert('Photo not saved', message);
+              }}
+            />
+          </Modal>
+        ) : null}
+        <Modal animationType="fade" transparent visible={gapPrompt} onRequestClose={() => setGapPrompt(false)}>
+          <View style={styles.gapBackdrop}>
+            <View style={styles.gapCard}>
+              <Text style={styles.gapTitle}>A stage is still missing</Text>
+              <Text style={styles.gapCopy}>
+                Completing this job with a missing Before, During, or After photo is written to the audit log. Add the reason.
+              </Text>
+              <TextInput
+                value={gapReason}
+                onChangeText={setGapReason}
+                placeholder="Why is a photo missing?"
+                multiline
+                style={styles.gapInput}
+              />
+              <Pressable
+                accessibilityRole="button"
+                disabled={isUpdatingStatus || gapReason.trim().length < 3}
+                onPress={() => void confirmComplete(gapReason.trim())}
+                style={[styles.gapSubmit, (isUpdatingStatus || gapReason.trim().length < 3) && styles.buttonDisabled]}>
+                <Text style={styles.viewerButtonLabel}>{isUpdatingStatus ? 'Saving' : 'Complete and log the reason'}</Text>
+              </Pressable>
+              <Pressable accessibilityRole="button" onPress={() => setGapPrompt(false)} style={styles.gapCancel}>
+                <Text style={styles.viewerSecondaryLabel}>Cancel</Text>
+              </Pressable>
+            </View>
+          </View>
+        </Modal>
         <StageReminderSheet
           visible={reminderTarget != null}
           stageLabel={reminderTarget ? stageLabel(reminderTarget.stage) : ''}
@@ -1304,12 +1516,31 @@ export default function ProjectDetailsScreen() {
                       </View>
                     </Modal>
                     <View style={styles.viewerMeta}>
-                      <Text style={styles.viewerMetaText}>{formatCapturedAt(selectedPhoto.photoData.capturedAt)}</Text>
-                      {projectMode === 'compliance' && hasGps(selectedPhoto.photoData.location) ? (
+                      {selectedPhoto.photoData.importedUnverified ? (
+                        <Text style={styles.viewerMetaText}>Imported, unverified</Text>
+                      ) : null}
+                      <Text style={styles.viewerMetaText}>
+                        Device {formatCapturedAt(selectedPhoto.photoData.capturedAt)}
+                      </Text>
+                      <Text style={styles.viewerMetaText}>
+                        Server {formatCapturedAt(selectedPhoto.photoData.serverCapturedAt)}
+                      </Text>
+                      {selectedPhoto.photoData.driftFlag ? (
+                        <Text style={styles.viewerMetaText}>Device clock differs from the server by more than 5 minutes.</Text>
+                      ) : null}
+                      {hasGps(selectedPhoto.photoData.location) ? (
                         <Text style={styles.viewerMetaText}>
                           GPS {selectedPhoto.photoData.location?.latitude?.toFixed(5)},{' '}
                           {selectedPhoto.photoData.location?.longitude?.toFixed(5)}
                         </Text>
+                      ) : (
+                        <Text style={styles.viewerMetaText}>GPS missing</Text>
+                      )}
+                      {selectedPhoto.photoData.operativeName ? (
+                        <Text style={styles.viewerMetaText}>{selectedPhoto.photoData.operativeName}</Text>
+                      ) : null}
+                      {selectedPhoto.photoData.sha256 ? (
+                        <Text style={styles.viewerMetaText}>SHA-256 {selectedPhoto.photoData.sha256}</Text>
                       ) : null}
                     </View>
                     <View style={styles.noteField}>
@@ -1348,12 +1579,15 @@ export default function ProjectDetailsScreen() {
                     </Pressable>
                     <Pressable
                       accessibilityRole="button"
-                      onPress={() => choosePhotoSource(selectedPhoto.locationId, selectedPhoto.stage)}
+                      onPress={() =>
+                        choosePhotoSource(
+                          selectedPhoto.locationId,
+                          selectedPhoto.stage,
+                          selectedPhoto.photoData.evidenceId ?? null,
+                        )
+                      }
                       style={styles.viewerSecondary}>
-                      <Text style={styles.viewerSecondaryLabel}>Retake / Replace</Text>
-                    </Pressable>
-                    <Pressable accessibilityRole="button" onPress={deletePhoto} style={styles.viewerDanger}>
-                      <Text style={styles.viewerDangerLabel}>Delete Photo</Text>
+                      <Text style={styles.viewerSecondaryLabel}>Add correction photo</Text>
                     </Pressable>
                   </ScrollView>
                 </>
@@ -1370,7 +1604,7 @@ function LocationCard({
   location,
   isQuick,
   uploadingStage,
-  onRename,
+  onSaveDetails,
   onDelete,
   onCapture,
   onOpen,
@@ -1380,7 +1614,7 @@ function LocationCard({
   location: ProjectLocation;
   isQuick: boolean;
   uploadingStage: SlotStage | null;
-  onRename: (name: string) => void;
+  onSaveDetails: (details: { name: string; itemCode: string; product: string; batch: string }) => void;
   onDelete: () => void;
   onCapture: (stage: SlotStage) => void;
   onOpen: (stage: SlotStage) => void;
@@ -1389,8 +1623,28 @@ function LocationCard({
 }) {
   const theme = useTheme();
   const [name, setName] = useState(location.name);
+  const [itemCode, setItemCode] = useState(location.itemCode);
+  const [product, setProduct] = useState(location.product);
+  const [batch, setBatch] = useState(location.batch);
   const [isFocused, setIsFocused] = useState(false);
   const progress = filledCount(location);
+  const saveDetails = (next?: { name?: string; itemCode?: string; product?: string; batch?: string }) => {
+    const details = {
+      name: (next?.name ?? name).trim() || location.name,
+      itemCode: (next?.itemCode ?? itemCode).trim(),
+      product: (next?.product ?? product).trim(),
+      batch: (next?.batch ?? batch).trim(),
+    };
+    if (
+      details.name === location.name &&
+      details.itemCode === location.itemCode &&
+      details.product === location.product &&
+      details.batch === location.batch
+    ) {
+      return;
+    }
+    onSaveDetails(details);
+  };
 
   useEffect(() => {
     if (!isFocused) {
@@ -1407,14 +1661,18 @@ function LocationCard({
           onFocus={() => setIsFocused(true)}
           onBlur={() => {
             setIsFocused(false);
-            onRename(name);
+            saveDetails({ name });
           }}
-          onSubmitEditing={() => onRename(name)}
+          onSubmitEditing={() => saveDetails({ name })}
           returnKeyType="done"
           blurOnSubmit
           style={[styles.cardTitle, { color: theme.text, borderColor: theme.backgroundSelected }]}
         />
-        {isQuick ? null : progress === 3 ? (
+        {location.archived ? (
+          <View style={styles.progressBadge}>
+            <Text style={styles.progressLabel}>Archived</Text>
+          </View>
+        ) : isQuick ? null : progress === 3 ? (
           <View style={[styles.progressBadge, styles.progressComplete]}>
             <Text style={[styles.progressLabel, styles.progressCompleteLabel]}>Complete</Text>
           </View>
@@ -1425,17 +1683,43 @@ function LocationCard({
         )}
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={`Delete ${location.name}`}
+          accessibilityLabel={`Archive ${location.name}`}
           hitSlop={8}
           onPress={onDelete}
           style={styles.deleteLocation}>
           <Ionicons name="trash-outline" size={18} color="#B42318" />
         </Pressable>
       </View>
+      <View style={styles.detailRow}>
+        <TextInput
+          value={itemCode}
+          onChangeText={setItemCode}
+          onEndEditing={() => saveDetails()}
+          placeholder="Item ID"
+          placeholderTextColor={theme.textSecondary}
+          style={[styles.detailInput, { color: theme.text, borderColor: theme.backgroundSelected }]}
+        />
+        <TextInput
+          value={product}
+          onChangeText={setProduct}
+          onEndEditing={() => saveDetails()}
+          placeholder="Product"
+          placeholderTextColor={theme.textSecondary}
+          style={[styles.detailInput, { color: theme.text, borderColor: theme.backgroundSelected }]}
+        />
+        <TextInput
+          value={batch}
+          onChangeText={setBatch}
+          onEndEditing={() => saveDetails()}
+          placeholder="Batch"
+          placeholderTextColor={theme.textSecondary}
+          style={[styles.detailInput, { color: theme.text, borderColor: theme.backgroundSelected }]}
+        />
+      </View>
       <View style={styles.slots}>
         {SLOT_STAGES.map((stage) => {
           const photo = location[stage.key];
-          const locked = slotLocked(stage.key, location, isQuick);
+          const locked = location.archived || slotLocked(stage.key, location, isQuick);
           const isUploading = uploadingStage === stage.key;
           return (
             <PhotoSlotView
@@ -1454,7 +1738,7 @@ function LocationCard({
       {isQuick
         ? null
         : (['during', 'after'] as const).map((stage) => {
-            if (location[stage] || slotLocked(stage, location, false) || uploadingStage === stage) {
+            if (location.archived || location[stage] || slotLocked(stage, location, false) || uploadingStage === stage) {
               return null;
             }
             const scheduled = reminderLabel(stage);
@@ -1525,6 +1809,11 @@ function PhotoSlotView({
         {photo.pending ? (
           <View style={styles.pendingBadge}>
             <Text style={styles.pendingBadgeLabel}>Pending Sync</Text>
+          </View>
+        ) : null}
+        {photo.importedUnverified ? (
+          <View style={styles.importedBadge}>
+            <Text style={styles.pendingBadgeLabel}>Imported</Text>
           </View>
         ) : null}
         {showGps && hasGps(photo.location) ? (
@@ -1698,6 +1987,52 @@ const styles = StyleSheet.create({
   buttonDisabled: {
     opacity: 0.55,
   },
+  gapBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: Spacing.four,
+  },
+  gapCard: {
+    width: '100%',
+    maxWidth: 420,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 18,
+    padding: Spacing.four,
+    gap: Spacing.two,
+  },
+  gapTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#11181C',
+  },
+  gapCopy: {
+    color: '#475467',
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  gapInput: {
+    minHeight: 88,
+    borderWidth: 1,
+    borderColor: '#D0D5DD',
+    borderRadius: 12,
+    padding: 12,
+    fontSize: 16,
+    textAlignVertical: 'top',
+  },
+  gapSubmit: {
+    minHeight: 48,
+    borderRadius: 12,
+    backgroundColor: '#067647',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  gapCancel: {
+    minHeight: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   errorText: {
     color: '#B42318',
     fontSize: 14,
@@ -1717,6 +2052,27 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: Spacing.two,
+  },
+  detailRow: {
+    flexDirection: 'row',
+    gap: Spacing.one,
+  },
+  detailInput: {
+    flex: 1,
+    minHeight: 36,
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingHorizontal: 8,
+    fontSize: 12,
+  },
+  importedBadge: {
+    position: 'absolute',
+    left: 6,
+    bottom: 6,
+    backgroundColor: '#7A2E0E',
+    borderRadius: 8,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
   },
   deleteLocation: {
     width: 28,

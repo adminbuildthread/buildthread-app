@@ -67,7 +67,12 @@ export function subscribeToProjects(
             locationNames: readStoredNames(project.get('locationNames')),
             projectMode: project.get('projectMode') === 'quick' ? 'quick' : 'compliance',
             pendingCompliance: readPendingCompliance(project.get('pendingCompliance')),
-            status: project.get('status') === 'completed' ? 'completed' : 'active',
+            status:
+              project.get('status') === 'completed'
+                ? 'completed'
+                : project.get('status') === 'archived'
+                  ? 'archived'
+                  : 'active',
             endDate: typeof endDate === 'string' && endDate.trim() ? endDate.trim() : undefined,
           };
         }),

@@ -72,8 +72,10 @@ export function PhotoCapture({
     setTaking(true);
     try {
       const picture = await cameraRef.current.takePictureAsync({
-        quality: 0.6,
+        quality: 1,
         base64: true,
+        exif: true,
+        skipProcessing: true,
         shutterSound: false,
       });
       const nextShot = picture?.uri ? await shotFromPicture(picture.uri, picture.base64) : null;

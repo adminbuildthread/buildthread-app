@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 
 import { isFirebaseConfigured, type ProjectRecord } from '@/lib/firebase-config';
+import { cacheProjectList, readCachedProjectList } from '@/lib/local-cache';
 
 export type Project = ProjectRecord;
 
@@ -69,15 +70,25 @@ export function useProjects(): ProjectsState {
                   return;
                 }
                 setState({ projects, source: 'live', errorMessage: null });
+                void cacheProjectList(projects);
               },
               (error) => {
                 if (!active) {
                   return;
                 }
-                setState({
-                  projects: [],
-                  source: 'error',
-                  errorMessage: firestoreErrorMessage(error),
+                void readCachedProjectList<Project[]>().then((cached) => {
+                  if (!active) {
+                    return;
+                  }
+                  if (cached && cached.length > 0) {
+                    setState({ projects: cached, source: 'live', errorMessage: null });
+                    return;
+                  }
+                  setState({
+                    projects: [],
+                    source: 'error',
+                    errorMessage: firestoreErrorMessage(error),
+                  });
                 });
               },
             );

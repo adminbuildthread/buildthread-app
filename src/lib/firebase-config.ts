@@ -1,3 +1,5 @@
+import type { PendingCompliancePhoto } from '@/utils/pendingCompliance';
+
 type FirebaseWebConfig = {
   apiKey: string;
   authDomain: string;
@@ -36,8 +38,6 @@ export function readFirestoreDatabaseId(): string | undefined {
   return databaseId ? databaseId : undefined;
 }
 
-import type { PendingCompliancePhoto } from '@/utils/pendingCompliance';
-
 export type ProjectRecord = {
   id: string;
   name: string;
@@ -47,6 +47,6 @@ export type ProjectRecord = {
   locationNames?: string[];
   projectMode?: 'compliance' | 'quick';
   pendingCompliance?: PendingCompliancePhoto[];
-  status?: 'active' | 'completed';
+  status?: 'active' | 'completed' | 'archived';
   endDate?: string;
 };

@@ -1,4 +1,6 @@
 import { File, Paths } from 'expo-file-system';
+
+import { readEvidence } from '@/lib/evidence-record';
 import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
 import { Platform } from 'react-native';
@@ -20,24 +22,36 @@ export type ReportProject = {
   status?: string;
 };
 
-export type ReportGps = {
-  latitude?: number;
-  longitude?: number;
-};
-
 export type ReportPhoto = {
   downloadUrl?: string;
-  capturedAt?: string;
-  location?: ReportGps | null;
+  deviceCapturedAt?: string;
+  serverCapturedAt?: string;
+  latitude?: number;
+  longitude?: number;
   note?: string;
+  sha256?: string;
+  operativeName?: string;
+  importedUnverified?: boolean;
+  clockDriftFlag?: boolean | null;
+  clockDriftMs?: number | null;
+  legacy?: boolean;
 } | null;
 
 export type ReportLocation = {
   name: string;
   order?: number;
+  itemCode?: string;
+  product?: string;
+  batch?: string;
   before: ReportPhoto;
   during: ReportPhoto;
   after: ReportPhoto;
+};
+
+export type ReportAudit = {
+  summary: string;
+  at?: string;
+  reason?: string;
 };
 
 export type ReportCompanyProfile = {
@@ -93,24 +107,38 @@ function summaryItem(label: string, value: string | undefined, wide = false): st
   return `<div class="summary-item${wide ? ' wide' : ''}"><div class="summary-label">${escapeHtml(label)}</div><div class="summary-value">${shown}</div></div>`;
 }
 
-function slotHtml(label: string, photo: ReportPhoto, showGps: boolean): string {
+function photoMeta(photo: ReportPhoto): string {
+  if (!photo) {
+    return '';
+  }
+  const lines = [
+    photo.importedUnverified ? 'Imported, unverified' : '',
+    photo.legacy ? 'Earlier record, no hash' : '',
+    photo.deviceCapturedAt ? `Device ${formatWhen(photo.deviceCapturedAt)}` : 'Device time missing',
+    photo.serverCapturedAt ? `Server ${formatWhen(photo.serverCapturedAt)}` : 'Server time missing',
+    photo.clockDriftFlag
+      ? `Clock drift over 5 minutes${typeof photo.clockDriftMs === 'number' ? ` (${Math.round(photo.clockDriftMs / 1000)}s)` : ''}`
+      : photo.clockDriftFlag === false
+        ? 'Device and server time agree'
+        : 'Clock drift not checked',
+    typeof photo.latitude === 'number' && typeof photo.longitude === 'number'
+      ? `GPS ${photo.latitude.toFixed(5)}, ${photo.longitude.toFixed(5)}`
+      : 'GPS missing',
+    photo.operativeName ? `Operative ${text(photo.operativeName)}` : '',
+    photo.sha256 ? `SHA-256 ${escapeHtml(photo.sha256)}` : '',
+    text(photo.note) ? `Note ${text(photo.note)}` : '',
+  ].filter(Boolean);
+  return lines.map((line) => `<div class="meta">${line}</div>`).join('');
+}
+
+function slotHtml(label: string, photo: ReportPhoto): string {
   if (!photo?.downloadUrl) {
     return `<div class="slot"><div class="empty">No photo</div><div class="stage">${escapeHtml(label)}</div></div>`;
   }
-  const gps =
-    showGps && photo.location
-      ? `<div class="meta">GPS ${
-          typeof photo.location.latitude === 'number' ? photo.location.latitude.toFixed(5) : '—'
-        }, ${typeof photo.location.longitude === 'number' ? photo.location.longitude.toFixed(5) : '—'}</div>`
-      : '';
-  const captured = formatWhen(photo.capturedAt);
-  const note = text(photo.note);
   return `<div class="slot">
     <img class="photo" src="${escapeHtml(photo.downloadUrl)}" alt="${escapeHtml(label)} photo" />
     <div class="stage">${escapeHtml(label)}</div>
-    ${captured ? `<div class="meta">${captured}</div>` : ''}
-    ${gps}
-    ${note ? `<div class="note">${note}</div>` : ''}
+    ${photoMeta(photo)}
   </div>`;
 }
 
@@ -118,10 +146,12 @@ export function generateProjectReportHtml({
   project,
   locations,
   companyProfile,
+  audit,
 }: {
   project: ReportProject;
   locations: ReportLocation[];
   companyProfile?: ReportCompanyProfile | null;
+  audit?: ReportAudit[];
 }): string {
   const profile = companyProfile ?? {};
   const compliance = project.projectMode === 'compliance';
@@ -154,8 +184,24 @@ export function generateProjectReportHtml({
   const cards = [...locations]
     .sort((left, right) => (left.order ?? 0) - (right.order ?? 0))
     .map((location) => {
-      const slots = STAGES.map((stage) => slotHtml(stage.label, location[stage.key], compliance)).join('');
-      return `<section class="card"><h2>${text(location.name) || 'Location'}</h2><div class="slots">${slots}</div></section>`;
+      const slots = STAGES.map((stage) => slotHtml(stage.label, location[stage.key])).join('');
+      const itemLine = [
+        location.itemCode ? `Item ${text(location.itemCode)}` : '',
+        location.product ? `Product ${text(location.product)}` : '',
+        location.batch ? `Batch ${text(location.batch)}` : '',
+      ]
+        .filter(Boolean)
+        .join(' · ');
+      return `<section class="card"><h2>${text(location.name) || 'Location'}</h2>${
+        itemLine ? `<div class="item">${itemLine}</div>` : ''
+      }<div class="slots">${slots}</div></section>`;
+    })
+    .join('');
+  const auditHtml = (audit ?? [])
+    .map((entry) => {
+      const when = entry.at ? formatWhen(entry.at) : '';
+      const reason = text(entry.reason);
+      return `<li>${when ? `${when} — ` : ''}${text(entry.summary) || 'Recorded'}${reason ? ` (${reason})` : ''}</li>`;
     })
     .join('');
   const generated = escapeHtml(
@@ -192,8 +238,10 @@ export function generateProjectReportHtml({
     .photo { width: 100%; height: 150px; object-fit: cover; border-radius: 6px; background: #f4f4f5; }
     .empty { display: flex; align-items: center; justify-content: center; height: 150px; border: 1px dashed #d4d4d8; border-radius: 6px; color: #71717a; }
     .stage { margin-top: 4px; font-weight: 700; }
-    .meta, .note { color: #3f3f46; }
+    .item { padding: 0 10px; color: #3f3f46; }
+    .meta, .note { color: #3f3f46; word-break: break-all; }
     .note { white-space: pre-wrap; }
+    ul { margin: 0; padding-left: 18px; }
     footer { margin-top: 8px; color: #71717a; font-size: 10px; }
   </style>
 </head>
@@ -206,7 +254,10 @@ export function generateProjectReportHtml({
   <h1>${text(project.name) || 'Project'}</h1>
   <section class="summary">${summary}</section>
   ${cards || '<p>No locations yet.</p>'}
-  <footer>Generated ${generated}</footer>
+  <section class="card"><h2>Audit trail</h2><div class="slots" style="display:block">${
+    auditHtml ? `<ul>${auditHtml}</ul>` : '<p>No audit events recorded.</p>'
+  }</div></section>
+  <footer>Generated ${generated}. Times shown in this report use the device locale. Evidence device times are stored in UTC and stamped in UK time.</footer>
 </body>
 </html>`;
 }
@@ -215,7 +266,7 @@ function readText(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
-function readPhoto(value: unknown): ReportPhoto {
+function readLegacyPhoto(value: unknown): ReportPhoto {
   if (!value || typeof value !== 'object') {
     return null;
   }
@@ -225,23 +276,28 @@ function readPhoto(value: unknown): ReportPhoto {
     return null;
   }
   const location = record.location;
-  const point =
-    location && typeof location === 'object'
-      ? {
-          latitude: typeof (location as { latitude?: unknown }).latitude === 'number'
-            ? (location as { latitude: number }).latitude
-            : undefined,
-          longitude: typeof (location as { longitude?: unknown }).longitude === 'number'
-            ? (location as { longitude: number }).longitude
-            : undefined,
-        }
-      : null;
+  const point = location && typeof location === 'object' ? (location as { latitude?: unknown; longitude?: unknown }) : null;
   return {
     downloadUrl,
-    capturedAt: readText(record.capturedAt),
-    location: point,
+    deviceCapturedAt: readText(record.capturedAt),
+    latitude: typeof point?.latitude === 'number' ? point.latitude : undefined,
+    longitude: typeof point?.longitude === 'number' ? point.longitude : undefined,
     note: readText(record.note),
+    legacy: true,
   };
+}
+
+function readReportTime(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.length > 0) {
+    return value;
+  }
+  if (value && typeof value === 'object' && 'toDate' in value && typeof value.toDate === 'function') {
+    const date = value.toDate();
+    if (date instanceof Date && !Number.isNaN(date.getTime())) {
+      return date.toISOString();
+    }
+  }
+  return undefined;
 }
 
 export async function exportProjectReport(project: ExportableProject): Promise<void> {
@@ -251,23 +307,71 @@ export async function exportProjectReport(project: ExportableProject): Promise<v
     import('@/lib/firebase-auth'),
   ]);
   const database = getDb();
-  const [projectSnapshot, profileSnapshot, locationsSnapshot] = await Promise.all([
+  const [projectSnapshot, profileSnapshot, locationsSnapshot, evidenceSnapshot, auditSnapshot] = await Promise.all([
     getDoc(doc(database, 'projects', project.id)),
     getDoc(doc(database, 'settings', requireUserId())),
     getDocs(query(collection(database, 'projects', project.id, 'locations'), orderBy('order', 'asc'))),
+    getDocs(collection(database, 'projects', project.id, 'evidence')),
+    getDocs(collection(database, 'projects', project.id, 'audit')),
   ]);
   const projectData = projectSnapshot.data() ?? {};
   const profileData = profileSnapshot.data() ?? {};
+  const evidence = evidenceSnapshot.docs.flatMap((item) => {
+    const record = readEvidence(item.id, item.data());
+    return record ? [record] : [];
+  });
+  const latestFor = (locationId: string, stage: 'before' | 'during' | 'after'): ReportPhoto => {
+    const matches = evidence.filter((item) => item.locationId === locationId && item.stage === stage);
+    const latest = matches.sort((left, right) => {
+      const leftTime = Date.parse(left.serverCapturedAt ?? left.deviceCapturedAt ?? '') || 0;
+      const rightTime = Date.parse(right.serverCapturedAt ?? right.deviceCapturedAt ?? '') || 0;
+      return rightTime - leftTime;
+    })[0];
+    if (!latest) {
+      return null;
+    }
+    const downloadUrl = latest.stampedUrl || latest.originalUrl;
+    if (!downloadUrl) {
+      return null;
+    }
+    return {
+      downloadUrl,
+      deviceCapturedAt: latest.deviceCapturedAt ?? undefined,
+      serverCapturedAt: latest.serverCapturedAt ?? undefined,
+      latitude: latest.latitude ?? undefined,
+      longitude: latest.longitude ?? undefined,
+      note: latest.note,
+      sha256: latest.originalSha256,
+      operativeName: latest.operativeName,
+      importedUnverified: latest.importedUnverified,
+      clockDriftFlag: latest.clockDriftFlag,
+      clockDriftMs: latest.clockDriftMs,
+    };
+  };
   const locations: ReportLocation[] = locationsSnapshot.docs.map((locationDoc) => {
     const data = locationDoc.data();
     return {
       name: readText(data.name)?.trim() || 'Location',
       order: typeof data.order === 'number' ? data.order : 0,
-      before: readPhoto(data.before),
-      during: readPhoto(data.during),
-      after: readPhoto(data.after),
+      itemCode: readText(data.itemCode),
+      product: readText(data.product),
+      batch: readText(data.batch),
+      before: latestFor(locationDoc.id, 'before') ?? readLegacyPhoto(data.before),
+      during: latestFor(locationDoc.id, 'during') ?? readLegacyPhoto(data.during),
+      after: latestFor(locationDoc.id, 'after') ?? readLegacyPhoto(data.after),
     };
   });
+  const audit: ReportAudit[] = auditSnapshot.docs
+    .map((item) => {
+      const data = item.data();
+      return {
+        summary: readText(data.summary) ?? '',
+        at: readReportTime(data.at),
+        reason: readText(data.reason),
+      };
+    })
+    .sort((left, right) => (Date.parse(right.at ?? '') || 0) - (Date.parse(left.at ?? '') || 0))
+    .slice(0, 40);
   const html = generateProjectReportHtml({
     project: {
       name: readText(projectData.name) || project.name || 'Project',
@@ -290,6 +394,7 @@ export async function exportProjectReport(project: ExportableProject): Promise<v
       website: readText(profileData.website),
       registrationNumber: readText(profileData.registrationNumber),
     },
+    audit,
   });
   const file = await Print.printToFileAsync({
     html,
