@@ -47,7 +47,6 @@ function saveErrorMessage(error: unknown): string {
 }
 
 export default function NewProjectScreen() {
-  const theme = useTheme();
   const [projectMode, setProjectMode] = useState<ProjectMode>('compliance');
   const [name, setName] = useState('');
   const [clientName, setClientName] = useState('');
@@ -111,6 +110,12 @@ export default function NewProjectScreen() {
         notes,
         projectMode,
         userId: requireUserId(),
+      });
+      const { writeAudit } = await import('@/lib/audit');
+      await writeAudit({
+        projectId: docRef.id,
+        action: 'project_created',
+        summary: `${projectMode === 'quick' ? 'Quick Log' : 'Compliance'} project created.`,
       });
       router.replace({ pathname: '/project/[id]', params: { id: docRef.id, name: projectName } });
     } catch (error) {

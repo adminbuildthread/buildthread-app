@@ -1,4 +1,4 @@
-import { getDownloadURL, getStorage, listAll, ref, type FirebaseStorage } from 'firebase/storage';
+import { deleteObject, getDownloadURL, getStorage, listAll, ref, type FirebaseStorage } from 'firebase/storage';
 
 import { getFirebaseApp } from '@/lib/firebase';
 
@@ -11,4 +11,4 @@ export function getProjectStorage(): FirebaseStorage {
   return storage;
 }
 
-export { getDownloadURL, listAll, ref };
+export { deleteObject, getDownloadURL, listAll, ref };

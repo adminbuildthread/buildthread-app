@@ -42,7 +42,6 @@ function saveErrorMessage(error: unknown): string {
 }
 
 export default function EditProjectScreen() {
-  const theme = useTheme();
   const { id: idParam } = useLocalSearchParams<{ id: string }>();
   const id = firstParam(idParam);
   const [name, setName] = useState('');
@@ -130,6 +129,12 @@ export default function EditProjectScreen() {
         endDate: endDate.trim(),
         notes: notes.trim(),
       });
+      const { writeAudit } = await import('@/lib/audit');
+      await writeAudit({
+        projectId: id,
+        action: 'project_updated',
+        summary: 'Project details updated.',
+      });
       router.back();
     } catch (error) {
       Alert.alert('Could not save project', saveErrorMessage(error));
@@ -137,28 +142,25 @@ export default function EditProjectScreen() {
     }
   };
 
-  const deleteProject = async () => {
+  const archiveProject = async () => {
     if (isDeleting || isSaving) {
       return;
     }
     setIsDeleting(true);
     try {
-      const [{ deleteDoc, doc }, { getDb }] = await Promise.all([
-        import('@/lib/firestore'),
-        import('@/lib/firebase'),
-      ]);
-      await deleteDoc(doc(getDb(), 'projects', id));
+      const { archiveProject: archive } = await import('@/lib/project-actions');
+      await archive(id);
       router.replace('/' as '/(tabs)/index');
     } catch (error) {
-      Alert.alert('Could not delete project', saveErrorMessage(error));
+      Alert.alert('Could not archive project', saveErrorMessage(error));
       setIsDeleting(false);
     }
   };
 
-  const confirmDelete = () => {
-    Alert.alert('Delete this project?', 'This removes the project from your list.', [
+  const confirmArchive = () => {
+    Alert.alert('Archive this project?', 'The project leaves your active list. Photos, hashes, and the audit log stay on the record.', [
       { text: 'Cancel', style: 'cancel' },
-      { text: 'Delete', style: 'destructive', onPress: () => void deleteProject() },
+      { text: 'Archive', style: 'destructive', onPress: () => void archiveProject() },
     ]);
   };
 
@@ -232,10 +234,10 @@ export default function EditProjectScreen() {
                 accessibilityRole="button"
                 accessibilityState={{ disabled: isSaving || isDeleting }}
                 disabled={isSaving || isDeleting}
-                onPress={confirmDelete}
+                onPress={confirmArchive}
                 style={styles.deleteButton}>
                 {isDeleting ? <ActivityIndicator color="#B42318" /> : null}
-                <Text style={styles.deleteLabel}>{isDeleting ? 'Deleting' : 'Delete Project'}</Text>
+                <Text style={styles.deleteLabel}>{isDeleting ? 'Archiving' : 'Archive Project'}</Text>
               </Pressable>
             </ScrollView>
           )}

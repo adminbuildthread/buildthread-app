@@ -54,6 +54,8 @@ export default function HomeScreen() {
   const [projectFilter, setProjectFilter] = useState<'active' | 'completed'>('active');
   const [exportingProjectId, setExportingProjectId] = useState<string | null>(null);
   const [pendingUploads, setPendingUploads] = useState(0);
+  const [syncFailures, setSyncFailures] = useState(0);
+  const [now, setNow] = useState(0);
   const [queuedThumbs, setQueuedThumbs] = useState<
     { projectId: string; locationId: string; stage: string; localUri: string }[]
   >([]);
@@ -61,8 +63,8 @@ export default function HomeScreen() {
     { projectId: string; locationId: string; stage: string; triggerAt: number }[]
   >([]);
   const [isOnline, setIsOnline] = useState(true);
-  const activeProjects = projects.filter((project) => project.status !== 'completed');
-  const completedProjects = projects.filter((project) => project.status === 'completed');
+  const activeProjects = projects.filter((project) => project.status !== 'completed' && project.status !== 'archived');
+  const completedProjects = projects.filter((project) => project.status === 'completed' || project.status === 'archived');
   const visibleProjects = projectFilter === 'completed' ? completedProjects : activeProjects;
   const hasVisibleProjects = visibleProjects.length > 0;
   const { width: screenWidth } = useWindowDimensions();
@@ -96,7 +98,7 @@ export default function HomeScreen() {
     setShowPendingScrollHint((current) => (current === next ? current : next));
   }, []);
   const newestProjectId = useRef<string | undefined>(undefined);
-  const scrollX = useRef(new Animated.Value(0)).current;
+  const [scrollX] = useState(() => new Animated.Value(0));
 
   const resetProjectScroll = useCallback(() => {
     scrollX.setValue(0);
@@ -172,12 +174,13 @@ export default function HomeScreen() {
       }
       unsubscribe = subscribeOfflineQueue((items) => {
         setPendingUploads(items.length);
+        setSyncFailures(items.filter((item) => item.syncError).length);
         setQueuedThumbs(
           items.map((item) => ({
             projectId: item.projectId,
             locationId: item.locationId,
             stage: item.stage,
-            localUri: item.localUri,
+            localUri: item.stampedUri,
           })),
         );
       });
@@ -197,6 +200,7 @@ export default function HomeScreen() {
       }
       unsubscribe = subscribeReminders((items) => {
         const now = Date.now();
+        setNow(now);
         setStageReminders(
           items
             .filter((item) => item.triggerAt > now)
@@ -279,7 +283,6 @@ export default function HomeScreen() {
   };
   const statusLabel =
     source === 'sample' ? 'Sample projects' : source === 'loading' ? 'Connecting to Firestore' : source === 'error' ? errorMessage : null;
-  const now = Date.now();
   const pendingCompliance = activeProjects
     .filter((project) => project.projectMode !== 'quick')
     .flatMap((project) =>
@@ -342,11 +345,16 @@ export default function HomeScreen() {
           {pendingUploads > 0 ? (
             <ThemedText type="small" style={styles.pendingUploads}>
               {pendingUploads === 1 ? '1 photo waiting to sync' : `${pendingUploads} photos waiting to sync`}
+              {syncFailures > 0
+                ? syncFailures === 1
+                  ? ' · 1 failed and can be retried from the job'
+                  : ` · ${syncFailures} failed and can be retried from the job`
+                : ''}
             </ThemedText>
           ) : null}
           {!isOnline && source !== 'sample' ? (
             <ThemedText type="small" themeColor="textSecondary">
-              Firestore Saving <Text style={styles.offlineStatus}>But not connected</Text>
+              Offline. Saved photos will sync when you reconnect.
             </ThemedText>
           ) : statusLabel ? (
             <ThemedText
@@ -427,16 +435,16 @@ export default function HomeScreen() {
                     isDark ? styles.cardDark : styles.cardLight,
                     pressed && styles.pressed,
                   ]}>
-                  <View style={[styles.statusRow, project.status !== 'completed' && styles.statusRowActive]}>
-                    <View style={[styles.statusDot, project.status === 'completed' ? styles.statusDotComplete : styles.statusDotActive]} />
+                  <View style={[styles.statusRow, project.status === 'active' && styles.statusRowActive]}>
+                    <View style={[styles.statusDot, project.status === 'active' ? styles.statusDotActive : styles.statusDotComplete]} />
                     <Text
                       style={[
                         styles.statusLabel,
-                        project.status === 'completed' ? styles.statusLabelComplete : styles.statusLabelActive,
-                        isDark && project.status !== 'completed' && styles.statusLabelActiveDark,
-                        isDark && project.status === 'completed' && styles.statusLabelDark,
+                        project.status === 'active' ? styles.statusLabelActive : styles.statusLabelComplete,
+                        isDark && project.status === 'active' && styles.statusLabelActiveDark,
+                        isDark && project.status !== 'active' && styles.statusLabelDark,
                       ]}>
-                      {project.status === 'completed' ? 'Completed' : 'Active'}
+                      {project.status === 'archived' ? 'Archived' : project.status === 'completed' ? 'Completed' : 'Active'}
                     </Text>
                   </View>
                   {project.status === 'completed' ? (

@@ -5,10 +5,11 @@ import { ActivityIndicator, AppState, StyleSheet, useColorScheme, View } from 'r
 import NetInfo from '@react-native-community/netinfo';
 
 import { AnimatedSplashOverlay } from '@/components/animated-icon';
+import { VerifyEmail } from '@/components/verify-email';
 
 SplashScreen.preventAutoHideAsync();
 
-type SignedInUser = { uid: string } | null;
+type SignedInUser = { uid: string; email: string; emailVerified: boolean } | null;
 
 export default function RootLayout() {
   const colorScheme = useColorScheme();
@@ -29,7 +30,11 @@ export default function RootLayout() {
           return;
         }
         unsubscribe = onAuthStateChanged(getProjectAuth(), (nextUser) => {
-          setUser(nextUser ? { uid: nextUser.uid } : null);
+          setUser(
+            nextUser
+              ? { uid: nextUser.uid, email: nextUser.email ?? '', emailVerified: nextUser.emailVerified }
+              : null,
+          );
           setAuthLoading(false);
         });
       })
@@ -100,12 +105,23 @@ export default function RootLayout() {
       router.push({ pathname: '/project/[id]', params: { id: projectId } });
       return;
     }
-    if (user && onLogin) {
+    if (user?.emailVerified && onLogin) {
       router.replace('/' as '/(tabs)/index');
     }
   }, [authLoading, onLogin, reminderProjectId, router, user]);
 
-  const waitingForRoute = authLoading || (!user && !onLogin) || (!!user && onLogin);
+  const refreshUser = () => {
+    void import('@/lib/firebase-auth').then(({ getProjectAuth }) => {
+      const current = getProjectAuth().currentUser;
+      setUser(
+        current
+          ? { uid: current.uid, email: current.email ?? '', emailVerified: current.emailVerified }
+          : null,
+      );
+    });
+  };
+
+  const waitingForRoute = authLoading || (!user && !onLogin) || (!!user?.emailVerified && onLogin);
 
   return (
     <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
@@ -129,6 +145,7 @@ export default function RootLayout() {
           <ActivityIndicator size="large" color={colorScheme === 'dark' ? '#FFFFFF' : '#208AEF'} />
         </View>
       ) : null}
+      {user && !user.emailVerified ? <VerifyEmail email={user.email} onRefresh={refreshUser} /> : null}
     </ThemeProvider>
   );
 }

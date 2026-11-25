@@ -15,14 +15,17 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { DeleteAccountButton } from '@/components/delete-account';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
+import { privacyPolicyUrl } from '@/constants/legal';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
+import { openExternalUrl } from '@/lib/open-url';
 import { decodeBase64, uploadJpeg } from '@/lib/upload-jpeg';
 
 function logoPath(userId: string): string {
-  return `users/${userId}/company-logo.jpg`;
+  return `users/${userId}/company-logo-${Date.now()}.jpg`;
 }
 
 function readText(value: unknown): string {
@@ -54,6 +57,7 @@ export default function CompanyProfileScreen() {
   const [address, setAddress] = useState('');
   const [website, setWebsite] = useState('');
   const [registrationNumber, setRegistrationNumber] = useState('');
+  const [operativeName, setOperativeName] = useState('');
   const [logoUrl, setLogoUrl] = useState('');
   const [logoRevision, setLogoRevision] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
@@ -83,6 +87,7 @@ export default function CompanyProfileScreen() {
         setAddress(readText(data.address));
         setWebsite(readText(data.website));
         setRegistrationNumber(readText(data.registrationNumber));
+        setOperativeName(readText(data.operativeName));
         setLogoUrl(readText(data.logoUrl));
       } catch (error) {
         if (active) {
@@ -170,6 +175,7 @@ export default function CompanyProfileScreen() {
           address: address.trim(),
           website: website.trim(),
           registrationNumber: registrationNumber.trim(),
+          operativeName: operativeName.trim(),
           logoUrl,
           updatedAt: serverTimestamp(),
         },
@@ -246,6 +252,12 @@ export default function CompanyProfileScreen() {
                 </Pressable>
               ) : null}
 
+              <Field
+                label="Your name on evidence"
+                value={operativeName}
+                onChangeText={setOperativeName}
+                placeholder="Name burned onto photos"
+              />
               <Field label="Company / Trading Name" value={companyName} onChangeText={setCompanyName} placeholder="Required" />
               <Field
                 label="Phone Number"
@@ -297,6 +309,9 @@ export default function CompanyProfileScreen() {
                 {isSaving ? <ActivityIndicator color="#FFFFFF" /> : null}
                 <Text style={styles.submitLabel}>{isSaving ? 'Saving' : 'Save Profile'}</Text>
               </Pressable>
+              <Pressable accessibilityRole="link" onPress={() => void openExternalUrl(privacyPolicyUrl())} style={styles.signOut}>
+                <Text style={styles.privacy}>Privacy policy</Text>
+              </Pressable>
               <Pressable
                 accessibilityRole="button"
                 accessibilityState={{ disabled: isSigningOut }}
@@ -306,6 +321,7 @@ export default function CompanyProfileScreen() {
                 {isSigningOut ? <ActivityIndicator color="#B42318" /> : null}
                 <Text style={styles.signOutLabel}>{isSigningOut ? 'Signing out' : 'Sign Out'}</Text>
               </Pressable>
+              <DeleteAccountButton />
             </ScrollView>
           )}
         </KeyboardAvoidingView>
@@ -448,6 +464,12 @@ const styles = StyleSheet.create({
   },
   signOutLabel: {
     color: '#B42318',
+    fontSize: 16,
+    lineHeight: 22,
+    fontWeight: '700',
+  },
+  privacy: {
+    color: '#208AEF',
     fontSize: 16,
     lineHeight: 22,
     fontWeight: '700',

@@ -4,6 +4,7 @@ import {
   getAuth,
   initializeAuth,
   onAuthStateChanged,
+  sendEmailVerification,
   signInWithEmailAndPassword,
   signOut,
   type Auth,
@@ -28,6 +29,8 @@ function reactNativePersistence(): Persistence | null {
     return null;
   }
   try {
+    // Conditional require so web does not load the React Native persistence helper.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const authModule = require('@firebase/auth') as ReactNativeAuthModule;
     if (typeof authModule.getReactNativePersistence !== 'function') {
       return null;
@@ -75,6 +78,7 @@ export async function requireIdToken(): Promise<string> {
 export {
   createUserWithEmailAndPassword,
   onAuthStateChanged,
+  sendEmailVerification,
   signInWithEmailAndPassword,
   signOut,
 };

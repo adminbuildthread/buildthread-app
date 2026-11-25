@@ -1,6 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { createAudioPlayer, setAudioModeAsync, type AudioPlayer } from 'expo-audio';
 import * as Notifications from 'expo-notifications';
+import { AndroidImportance } from 'expo-notifications';
 import { Platform, Vibration } from 'react-native';
 
 const STORAGE_KEY = '@buildthread_reminders';
@@ -51,7 +52,7 @@ async function soundAlarm(): Promise<void> {
   try {
     await setAudioModeAsync({
       playsInSilentMode: true,
-      shouldPlayInBackground: true,
+      shouldPlayInBackground: false,
       interruptionMode: 'doNotMix',
     });
     alarmPlayer?.pause();
@@ -142,7 +143,7 @@ async function ensureChannel(): Promise<boolean> {
     await Notifications.deleteNotificationChannelAsync(CHANNEL_ID).catch(() => undefined);
     await Notifications.setNotificationChannelAsync(CHANNEL_ID, {
       name: 'Compliance reminders',
-      importance: Notifications.AndroidImportance.MAX,
+      importance: AndroidImportance.MAX,
       vibrationPattern: BUZZ,
       enableVibrate: true,
     });
