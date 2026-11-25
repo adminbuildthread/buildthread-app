@@ -1,56 +1,70 @@
-# Welcome to your Expo app 👋
+# BuildThread
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+BuildThread is an Expo app for UK tradespeople. It records before, during, and after photos for a job, with time, GPS, and an audit trail, starting with passive fire protection and other regulated work.
 
-## Get started
+The icon and splash in `assets/images/` are placeholders (a “BT” mark on blue). Replace them before store submission.
 
-1. Install dependencies
+## Firebase config
 
-   ```bash
-   npm install
-   ```
+The app reads Firebase from `EXPO_PUBLIC_FIREBASE_*` variables. Real values stay out of git.
 
-2. Start the app
+1. Copy `.env.example` to `.env.local`.
+2. Paste the web app config from Firebase console → Project settings → Your apps.
+3. Start the app with `npx expo start`.
 
-   ```bash
-   npx expo start
-   ```
+### EAS environment variables
 
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **src/app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
+Store builds do not see `.env.local`. Set the same variables on the EAS project for the `development`, `preview`, and `production` environments. Create them as plain text variables, not secrets, because Expo inlines `EXPO_PUBLIC_*` into the client bundle.
 
 ```bash
-npm run reset-project
+npx eas-cli env:create --name EXPO_PUBLIC_FIREBASE_API_KEY --value "<from Firebase console>" --environment production --visibility plaintext
+npx eas-cli env:create --name EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN --value "<project>.firebaseapp.com" --environment production --visibility plaintext
+npx eas-cli env:create --name EXPO_PUBLIC_FIREBASE_PROJECT_ID --value "<project id>" --environment production --visibility plaintext
+npx eas-cli env:create --name EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET --value "<project>.appspot.com" --environment production --visibility plaintext
+npx eas-cli env:create --name EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID --value "<sender id>" --environment production --visibility plaintext
+npx eas-cli env:create --name EXPO_PUBLIC_FIREBASE_APP_ID --value "<app id>" --environment production --visibility plaintext
 ```
 
-This command will move the starter code to the **example** directory and create a blank **src/app** directory where you can start developing.
+Repeat for `preview` and `development`. Leave `EXPO_PUBLIC_FIREBASE_DATABASE_ID` unset when the database is `(default)`.
 
-### Other setup steps
+Optional:
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+```bash
+npx eas-cli env:create --name EXPO_PUBLIC_PRIVACY_POLICY_URL --value "https://example.com/privacy" --environment production --visibility plaintext
+```
 
-## Learn more
+If that variable is unset, the app uses `expo.extra.privacyPolicyUrl` in `app.json` (`https://buildthread.app/privacy`). Host the real policy and point the URL at it before submission. `PRIVACY.md` is the draft.
 
-To learn more about developing your project with Expo, look at the following resources:
+## Builds
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+`eas.json` has three profiles:
 
-## Join the community
+- `development` — dev client, Android APK, internal distribution.
+- `preview` — store distribution, Android App Bundle, for Google Play closed testing. `eas submit --profile preview` uses the Play closed-testing track (`alpha`).
+- `production` — store distribution, Android App Bundle, production track.
 
-Join our community of developers creating universal apps.
+```bash
+npx eas-cli build --profile preview --platform android
+npx eas-cli submit --profile preview --platform android
+npx eas-cli build --profile production --platform all
+```
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+The iOS bundle id and Android package are `com.buildthread.app`. Version `1.0.0`, iOS build number `1`, Android version code `1`.
+
+## Security rules
+
+`firestore.rules`, `storage.rules`, and `firebase.json` are in the repo. They are not live until they are deployed:
+
+```bash
+npx firebase-tools deploy --only firestore:rules,storage
+```
+
+Use a Firebase project in the UK or the EU. The rules assume the `(default)` database. Evidence documents cannot be edited. Storage objects cannot be overwritten. Deletes run only while the account-deletion flag is set.
+
+## Scripts
+
+```bash
+npx expo start
+npx expo lint
+npx tsc --noEmit
+```

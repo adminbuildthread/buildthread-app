@@ -1,0 +1,94 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function accountDeletionRequested() {
+      return signedIn()
+        && get(/databases/$(database)/documents/settings/$(request.auth.uid)).data.deletionRequested == true;
+    }
+
+    function projectOwner(projectId) {
+      return signedIn()
+        && get(/databases/$(database)/documents/projects/$(projectId)).data.userId == request.auth.uid;
+    }
+
+    function evidenceCreateValid() {
+      let data = request.resource.data;
+      return data.operativeUid == request.auth.uid
+        && data.locationId is string
+        && data.locationId.size() > 0
+        && data.stage in ['before', 'during', 'after']
+        && data.source in ['camera', 'imported']
+        && data.importedUnverified is bool
+        && data.originalSha256 is string
+        && data.originalSha256.size() == 64
+        && data.originalPath is string
+        && data.stampedPath is string
+        && data.serverCapturedAt == request.time
+        && data.operativeName is string;
+    }
+
+    match /settings/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow create, update: if signedIn() && request.auth.uid == uid;
+      allow delete: if signedIn()
+        && request.auth.uid == uid
+        && resource.data.deletionRequested == true;
+    }
+
+    match /projects/{projectId} {
+      allow read: if signedIn() && resource.data.userId == request.auth.uid;
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.name is string
+        && request.resource.data.projectMode in ['compliance', 'quick'];
+      allow update: if signedIn()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.get('projectMode', '') == resource.data.get('projectMode', '');
+      allow delete: if signedIn()
+        && resource.data.userId == request.auth.uid
+        && accountDeletionRequested();
+
+      match /locations/{locationId} {
+        allow read: if projectOwner(projectId);
+        allow create: if projectOwner(projectId)
+          && request.resource.data.name is string;
+        allow update: if projectOwner(projectId)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'name',
+            'itemCode',
+            'product',
+            'batch',
+            'order',
+            'archived',
+            'archivedAt',
+            'locationNames'
+          ]);
+        allow delete: if projectOwner(projectId) && accountDeletionRequested();
+      }
+
+      match /evidence/{evidenceId} {
+        allow read: if projectOwner(projectId);
+        allow create: if projectOwner(projectId) && evidenceCreateValid();
+        allow update: if false;
+        allow delete: if projectOwner(projectId) && accountDeletionRequested();
+      }
+
+      match /audit/{auditId} {
+        allow read: if projectOwner(projectId);
+        allow create: if projectOwner(projectId)
+          && request.resource.data.actorUid == request.auth.uid
+          && request.resource.data.action is string
+          && request.resource.data.summary is string
+          && request.resource.data.at == request.time;
+        allow update: if false;
+        allow delete: if projectOwner(projectId) && accountDeletionRequested();
+      }
+    }
+  }
+}
